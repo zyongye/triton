@@ -9,19 +9,20 @@ import torch.distributed._symmetric_memory as symm_mem
 import torch.distributed as dist
 
 
-def make_empty(shape, dtype, device, all_gather):
+def make_empty(shape, dtype, device, all_gather, group_name):
     if all_gather:
         n_ranks = dist.get_world_size()
         ret = symm_mem.empty(shape, dtype=dtype, device=device)
 
-        ret_hdl = symm_mem.rendezvous(ret, dist.group.WORLD)
+        group = group_name if group_name else dist.group.WORLD
+        ret_hdl = symm_mem.rendezvous(ret, group)
         ret_bufs = tuple([ret_hdl.get_buffer(r, ret.shape, ret.dtype) for r in range(n_ranks)])
         return ret_bufs, ret, ret_hdl
     ret = torch.empty(shape, dtype=dtype, device=device)
     return (ret, ), ret, None
 
 
-def topk_forward(x, k, apply_softmax=True, dim=1, y_indx=None, n_rows=None, all_gather=False):
+def topk_forward(x, k, apply_softmax=True, dim=1, y_indx=None, n_rows=None, all_gather=False, group_name=None):
     if not isinstance(x, Tensor):
         x_shape = [x.shape[0] if n_rows is None else n_rows, x.shape[1]]
         x_shape_max = [x.shape[0], x.shape[1]]
@@ -39,16 +40,16 @@ def topk_forward(x, k, apply_softmax=True, dim=1, y_indx=None, n_rows=None, all_
     n_rows_out_max = n_rows_max * dist.get_world_size() if all_gather else n_rows_max
     # scratchpad tensors
     # NOTE: these are not returned
-    y_vals_bufs, y_vals, y_vals_hdl = make_empty((n_rows_out_max, k), x.dtype, dev, all_gather=all_gather)
+    y_vals_bufs, y_vals, y_vals_hdl = make_empty((n_rows_out_max, k), x.dtype, dev, all_gather=all_gather, group_name=group_name)
     if y_indx is None:
-        y_indx_bufs, y_indx, y_indx_hdl = make_empty((n_rows_out_max, k), torch.int16, dev, all_gather=all_gather)
+        y_indx_bufs, y_indx, y_indx_hdl = make_empty((n_rows_out_max, k), torch.int16, dev, all_gather=all_gather, group_name=group_name)
     else:
         y_indx_bufs, y_indx_hdl = (y_indx, ), None
     # create bitmatrix in transposed memory layout:
     n_cols_pad = cdiv(n_cols, BLOCK_N) * BLOCK_N
     n_cols_words = n_cols_pad // 32
     bitmatrix_bufs, bitmatrix_data, bitmatrix_hdl = make_empty((n_cols_words, cdiv(n_rows_out_max, 32) * 32),
-                                                               torch.uint32, dev, all_gather=all_gather)
+                                                               torch.uint32, dev, all_gather=all_gather, group_name=group_name)
     bitmatrix_data = torch.transpose(bitmatrix_data, 0, 1)[:n_rows_max]
     pids = cdiv(n_rows_max, BLOCK_M)
     _topk_forward[(pids, )](
@@ -85,8 +86,8 @@ def topk_backward(x, y_indx, dy_vals, k, n_rows, apply_softmax):
 class TopK(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x, k, apply_softmax, dim, y_indx, n_rows, all_gather):
-        y_vals, y_indx, bitmatrix = topk_forward(x, k, apply_softmax, dim, y_indx, n_rows, all_gather)
+    def forward(ctx, x, k, apply_softmax, dim, y_indx, n_rows, all_gather, group_name):
+        y_vals, y_indx, bitmatrix = topk_forward(x, k, apply_softmax, dim, y_indx, n_rows, all_gather, group_name)
         ctx.save_for_backward(x, y_indx)
         ctx.apply_softmax = apply_softmax
         ctx.k = k
@@ -108,6 +109,7 @@ def topk(
     y_indx: Optional[torch.Tensor] = None,
     n_rows: Optional[int] = None,
     all_gather: bool = False,
+    group_name = None,
 ):
     """
     Computes the top-k values and indices along a specified dimension of a tensor.
@@ -133,7 +135,7 @@ def topk(
     -------
     SparseMatrix: sparse matrix equal to `x` with non-selected entries set to 0
     """
-    y_vals, y_indx, bitmatrix = TopK.apply(x, k, apply_softmax, dim, y_indx, n_rows, all_gather)
+    y_vals, y_indx, bitmatrix = TopK.apply(x, k, apply_softmax, dim, y_indx, n_rows, all_gather, group_name)
     return SparseMatrix(vals=y_vals, indx=y_indx, mask=bitmatrix)
 
 
